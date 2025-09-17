@@ -1,6 +1,6 @@
 ##bisogna caricare la textgrid, il file .txt con la trascrizione e avere un token di HF
 
-
+###Giuseppe è scemo
 from huggingface_hub import notebook_login
 notebook_login()
 !pip install -q -U bitsandbytes
