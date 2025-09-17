@@ -1,0 +1,28 @@
+df <- textgrid_analysis
+df <- df %>% filter(!is.na(Section))
+
+df <- df %>% mutate(DSTR_onlytext = if_else(DSTR_summ == 'null', '0', as.character(DSTR_summ))) %>%
+    mutate(DSTR_cleaned = if_else(DSTR_summ == 'null', '0', 
+                                   gsub("null,\\s*|,\\s*null|null", "", DSTR_summ)))
+
+df <- df %>% mutate(DSTR_count = if_else(DSTR_cleaned == '0', 0,
+                             str_count(DSTR_cleaned, ',') + 1))
+
+
+
+df <- df %>% group_by(Speaker) %>%  mutate(SR_phon_phone_Norm = scale(SR_phon_phone))
+
+df_clean <-df %>%  filter(SR_phon_phone_Norm < 10)
+
+df_clean <- df_clean %>% mutate(DSTR_bin = if_else(DSTR_count > 1, 2, if_else(DSTR_count == 1, 1, 0) ))
+ggplot(df_clean, aes(x=SR_phon_phone_Norm, color=as.factor(DSTR_bin))) +    geom_density()
+
+df_clean <- df %>% mutate(N_s_type = if_else(N_s_type == 'I', '', N_s_type))
+
+
+df_clean <- df_clean %>% mutate(n_bld = str_count(DFN_summ, "BLD"))
+
+
+df_clean <- df_clean %>% mutate(n_bld = str_count(DFN_summ, "BLD"))
+df_clean <- df_clean %>% mutate(n_FLD = str_count(DFN_summ, "FLD"))
+write_csv(df_clean, "df_disfl.csv")
