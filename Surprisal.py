@@ -1,6 +1,3 @@
-##bisogna caricare la textgrid, il file .txt con la trascrizione e avere un token di HF
-
-###Giuseppe è scemo
 from huggingface_hub import notebook_login
 notebook_login()
 !pip install -q -U bitsandbytes
@@ -22,12 +19,16 @@ from google.colab import files
 from huggingface_hub import notebook_login
 from google.colab import drive
 
+from google.colab import files
+uploaded = files.upload()
+original_textgrid_filename = list(uploaded.keys())[0]  # prende automaticamente il file caricato
+print("File caricato:", original_textgrid_filename)
 
 
-drive.mount('/content/drive', force_remount=True)
+
 
 # !!! CAMBIA QUI !!!
-original_textgrid_filename = '/content/drive/MyDrive/modo_frog/PS01_prominenze.TextGrid'
+original_textgrid_filename = '/content/01SPEECHRATEREDUCTIONmerged.TextGrid'
 model_name = "meta-llama/Meta-Llama-3-8B-Instruct"
 
 
