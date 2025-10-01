@@ -1,0 +1,190 @@
+#CON TEXGRID
+!pip install praatio maverick-coref spacy openai
+!python -m spacy download it_core_news_sm
+
+# ====================== IMPORT ======================
+from praatio import textgrid
+import pandas as pd
+import spacy
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+from collections import defaultdict
+from maverick import Maverick
+from openai import OpenAI
+import os
+import time
+
+# ====================== OPENAI ======================
+os.environ["OPENAI_API_KEY"] = input("Inserisci la tua API key OpenAI: ")
+client = OpenAI()
+
+# ====================== SETUP COREF ======================
+nlp = spacy.load("it_core_news_sm")
+
+coref_model = Maverick(
+    hf_name_or_path="sapienzanlp/maverick-mes-ontonotes",
+    device="cpu"  # usa "cuda" se hai GPU disponibile
+)
+
+# ====================== DATABASE ======================
+db = pd.DataFrame(columns=["entity_id", "mentions", "vettore", "indice"])
+contatori = defaultdict(int)
+embedding_cache = {}  # cache per gli embeddings
+
+# Parole funzionali da ignorare nello streaming
+list_func = {"e", "o", "il", "la", "di", "a", "da", "in", "su", "con", "per"}
+FUNCTIONAL_POS_TAGS = {"PRON", "DET", "ADP", "CCONJ", "PART", "SCONJ", "NUM"}
+
+# ====================== FUNZIONI ======================
+def get_embedding_openai(text, max_retries=3, sleep_time=2):
+    """Restituisce embedding da OpenAI con cache e retry in caso di errori."""
+    if text in embedding_cache:
+        return embedding_cache[text]
+
+    for attempt in range(max_retries):
+        try:
+            resp = client.embeddings.create(
+                model="text-embedding-3-large",
+                input=text
+            )
+            vettore = resp.data[0].embedding
+            embedding_cache[text] = vettore
+            return vettore
+        except Exception as e:
+            print(f"Errore API embeddings: {e}. Retry {attempt+1}/{max_retries}")
+            time.sleep(sleep_time)
+    raise RuntimeError(f"Fallito ottenere embedding per '{text}' dopo {max_retries} tentativi.")
+
+def aggiungi_entita(parola, lemma, vettore, indice):
+    """Aggiunge una nuova entità al database con entity_id coerente (lemma + numero)."""
+    global db, contatori
+    contatori[lemma] += 1
+    entity_id = f"{lemma} {contatori[lemma]}"
+
+    nuova_riga = {
+        "entity_id": entity_id,
+        "vettore": vettore,
+        "indice": indice,
+        "mentions": [parola]
+    }
+    db = pd.concat([db, pd.DataFrame([nuova_riga])], ignore_index=True)
+    return entity_id
+
+def select_main_mention(cluster):
+    """Sceglie la menzione principale di un cluster (non pronominale/determinante se possibile)."""
+    for m in cluster:
+        doc = nlp(m)
+        if doc and doc[0].pos_ not in {"PRON", "DET"}:
+            return m
+    return cluster[0]
+
+def process_coref(text):
+    """Processa il testo intero con coreference e popola il db iniziale."""
+    global db
+    out = coref_model.predict(text, singletons=True)
+    clusters = out.get("clusters_text_mentions", [])
+
+    for cluster in clusters:
+        main_mention = select_main_mention(cluster)
+        lemma_main = nlp(main_mention)[0].lemma_.lower()
+        vettore = get_embedding_openai(main_mention)
+
+        contatori[lemma_main] += 1
+        entity_id = f"{lemma_main} {contatori[lemma_main]}"
+
+        new_row = {
+            "entity_id": entity_id,
+            "mentions": cluster.copy(),
+            "vettore": vettore,
+            "indice": len(cluster)
+        }
+        db = pd.concat([db, pd.DataFrame([new_row])], ignore_index=True)
+
+    return db
+
+def fai_coreference_online(parola, soglia=0.8):
+    """
+    Decide se una parola appartiene a un'entità già nota (GIVEN) o se è una nuova entità (NEW).
+    Restituisce tuple: (status, entity_id)
+    """
+    global db
+
+    vettore_nuovo = get_embedding_openai(parola)
+    lemma = nlp(parola)[0].lemma_.lower()
+
+    if not db.empty:
+        best_sim = 0
+        best_entity = None
+        for _, row in db.iterrows():
+            sim = cosine_similarity([vettore_nuovo], [row["vettore"]])[0][0]
+            if sim > best_sim:
+                best_sim = sim
+                best_entity = row["entity_id"]
+
+        if best_sim >= soglia:
+            print(f"{parola} → GIVEN ({best_entity}) [sim={best_sim:.2f}]")
+            return "GIVEN", best_entity
+
+    # Se non trova niente sopra soglia → nuova entità
+    entity_id = aggiungi_entita(parola, lemma, vettore_nuovo, len(db)+1)
+    print(f"{parola} → NEW ({entity_id})")
+    return "NEW", entity_id
+
+# ====================== LETTURA TEXTGRID ======================
+tg = textgrid.openTextgrid("/content/PS05.TextGrid", includeEmptyIntervals=True)
+
+# Trova il tier "ort"
+ort_tier = None
+for tier in tg.tiers:
+    if tier.name == "ort":
+        ort_tier = tier
+        break
+if ort_tier is None:
+    raise ValueError("Tier 'ort' non trovato nel TextGrid")
+
+# Ricostruisci testo intero (non filtriamo qui, serve al coref globale)
+tokens = [interval.label.strip() for interval in ort_tier.entries if interval.label.strip() != ""]
+testo = " ".join(tokens)
+
+# ====================== PASSAGGIO 2: STREAMING E NUOVO TIER ======================
+nuovi_interval = []
+
+for interval in ort_tier.entries:
+    parola = interval.label.strip()
+
+    if parola == "":
+        # Intervallo vuoto resta vuoto
+        nuovi_interval.append((interval.start, interval.end, ""))
+        continue
+
+    if parola in list_func or (parola.startswith('<') and parola.endswith('>')):
+        # Funzionali → etichetta "0"
+        nuovi_interval.append((interval.start, interval.end, "0"))
+        continue
+
+    doc = nlp(parola)
+    pos = doc[0].pos_
+
+    # Solo parole di contenuto (NOUN, PROPN, VERB, ADJ, ADV)
+    if pos not in {"NOUN", "PROPN", "VERB", "ADJ", "ADV"}:
+        # Tutte le altre (pronomi, determinanti ecc.) → "0"
+        nuovi_interval.append((interval.start, interval.end, "0"))
+        continue
+
+    # Se è parola di contenuto → calcolo given/new
+    status, entity_id = fai_coreference_online(parola)
+    nuovi_interval.append((interval.start, interval.end, status))
+
+# ====================== CREAZIONE NUOVO TIER ======================
+new_tier = textgrid.IntervalTier(
+    "coref_status",
+    nuovi_interval,
+    ort_tier.minTimestamp,
+    ort_tier.maxTimestamp
+)
+
+tg.addTier(new_tier)
+
+# Salva il nuovo TextGrid
+tg.save("/content/PS01final_with_coref.TextGrid", format="long_textgrid", includeBlankSpaces=True)
+print("Nuovo TextGrid salvato in /content/PS01final_with_coref.TextGrid")
